@@ -29,7 +29,7 @@ Quality=2
 ```
 
 ## How it works
-The plugin hooks D3D9 `Present` and keeps the previous final GPU frame in a texture. The current frame and previous frame are blended on the GPU immediately before presentation, so the effect is applied to the final image rather than individual world objects.
+The plugin hooks D3D9 `EndScene`, lets GTA finish its normal scene, then performs the temporal composite in a separate valid D3D9 scene before the game's `Present`. Frame copies use GPU `StretchRect`, and a D3D9 state block restores the game's render state after the effect.
 
 ## Limitation
 This is **temporal frame accumulation**, not true motion-vector/per-pixel directional blur. It can create smooth trails and reduce the perceived judder of 60 FPS, but high persistence can produce ghosting around moving objects.
