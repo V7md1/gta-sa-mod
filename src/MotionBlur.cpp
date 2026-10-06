@@ -3,18 +3,17 @@
 #include <d3d9.h>
 #include <algorithm>
 #include <atomic>
-#include <cstdint>
 #include <string>
 
 #pragma comment(lib, "d3d9.lib")
 
 namespace {
 
-using PresentFn = HRESULT (WINAPI*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
-using ResetFn   = HRESULT (WINAPI*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+using EndSceneFn = HRESULT (WINAPI*)(IDirect3DDevice9*);
+using ResetFn    = HRESULT (WINAPI*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 
-PresentFn g_originalPresent = nullptr;
-ResetFn   g_originalReset = nullptr;
+EndSceneFn g_originalEndScene = nullptr;
+ResetFn    g_originalReset = nullptr;
 void** g_vtable = nullptr;
 std::atomic<bool> g_installed{false};
 
@@ -35,7 +34,7 @@ UINT g_width = 0;
 UINT g_height = 0;
 D3DFORMAT g_format = D3DFMT_UNKNOWN;
 bool g_historyValid = false;
-bool g_inPresent = false;
+bool g_inEndScene = false;
 IDirect3DDevice9* g_device = nullptr;
 
 struct Vertex {
@@ -181,7 +180,8 @@ void ConfigureFullscreenDraw(IDirect3DDevice9* device) {
     device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
 }
 
-void DrawTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture, float alpha) {
+void DrawTexture(IDirect3DDevice9* device,
+                 IDirect3DTexture9* texture, float alpha) {
     if (!texture || g_width < 2 || g_height < 2)
         return;
 
@@ -210,7 +210,8 @@ void DrawTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture, float alp
         device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
     }
 
-    device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(Vertex));
+    device->DrawPrimitiveUP(
+        D3DPT_TRIANGLESTRIP, 2, quad, sizeof(Vertex));
 }
 
 void RenderTemporalBlend(IDirect3DDevice9* device) {
@@ -244,19 +245,10 @@ void RenderTemporalBlend(IDirect3DDevice9* device) {
         return;
     }
 
-    // Save every D3D state that the effect changes. This prevents the HUD/game
-    // renderer from inheriting our blend, texture, FVF, depth, or sampler state.
-    if (FAILED(g_stateBlock->Capture())) {
-        SafeRelease(backBuffer);
-        SafeRelease(currentSurface);
-        SafeRelease(historySurface);
-        return;
-    }
-
-    // Capture the frame exactly as GTA left it.
+    // This copy is deliberately outside BeginScene/EndScene because
+    // StretchRect is not valid inside a scene.
     if (FAILED(device->StretchRect(
             backBuffer, nullptr, currentSurface, nullptr, D3DTEXF_NONE))) {
-        g_stateBlock->Apply();
         SafeRelease(backBuffer);
         SafeRelease(currentSurface);
         SafeRelease(historySurface);
@@ -269,73 +261,101 @@ void RenderTemporalBlend(IDirect3DDevice9* device) {
             g_historyValid = true;
         }
 
-        g_stateBlock->Apply();
         SafeRelease(backBuffer);
         SafeRelease(currentSurface);
         SafeRelease(historySurface);
         return;
     }
 
-    // Always render back into the actual current render target.
-    if (FAILED(device->SetRenderTarget(0, backBuffer))) {
-        g_stateBlock->Apply();
+    // All actual drawing is performed inside a valid BeginScene/EndScene pair.
+    // The original GTA scene has already ended at this point.
+    if (FAILED(device->BeginScene())) {
         SafeRelease(backBuffer);
         SafeRelease(currentSurface);
         SafeRelease(historySurface);
         return;
     }
 
-    D3DVIEWPORT9 vp{};
-    if (SUCCEEDED(device->GetViewport(&vp))) {
-        vp.X = 0;
-        vp.Y = 0;
-        vp.Width = g_width;
-        vp.Height = g_height;
-        vp.MinZ = 0.0f;
-        vp.MaxZ = 1.0f;
-        device->SetViewport(&vp);
+    bool stateCaptured = SUCCEEDED(g_stateBlock->Capture());
+
+    if (stateCaptured) {
+        if (FAILED(device->SetRenderTarget(0, backBuffer))) {
+            stateCaptured = false;
+        } else {
+            D3DVIEWPORT9 vp{};
+            if (SUCCEEDED(device->GetViewport(&vp))) {
+                vp.X = 0;
+                vp.Y = 0;
+                vp.Width = g_width;
+                vp.Height = g_height;
+                vp.MinZ = 0.0f;
+                vp.MaxZ = 1.0f;
+                device->SetViewport(&vp);
+            }
+
+            ConfigureFullscreenDraw(device);
+
+            // Current frame first.
+            DrawTexture(device, g_current, 1.0f);
+
+            float historyAlpha =
+                g_cfg.blend * g_cfg.persistence * g_cfg.strength;
+
+            if (g_cfg.quality >= 3)
+                historyAlpha += 0.04f;
+            if (g_cfg.quality >= 4)
+                historyAlpha += 0.04f;
+
+            historyAlpha = std::clamp(historyAlpha, 0.0f, 0.85f);
+
+            // Previous frame over the current frame.
+            DrawTexture(device, g_history, historyAlpha);
+
+            device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+            device->SetTexture(0, nullptr);
+
+            // Restore GTA's state before closing our extra scene.
+            g_stateBlock->Apply();
+        }
     }
 
-    ConfigureFullscreenDraw(device);
+    device->EndScene();
 
-    // Current frame is fully opaque.
-    DrawTexture(device, g_current, 1.0f);
-
-    float historyAlpha =
-        g_cfg.blend * g_cfg.persistence * g_cfg.strength;
-
-    // Quality controls persistence slightly without adding expensive passes.
-    if (g_cfg.quality >= 3)
-        historyAlpha += 0.04f;
-    if (g_cfg.quality >= 4)
-        historyAlpha += 0.04f;
-
-    historyAlpha = std::clamp(historyAlpha, 0.0f, 0.85f);
-
-    // Previous frame is composited over the current frame.
-    DrawTexture(device, g_history, historyAlpha);
-
-    // The completed temporal frame becomes history for the next frame.
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-    device->SetTexture(0, nullptr);
-
-    if (FAILED(device->StretchRect(
+    // The final blurred frame becomes the history for the next frame.
+    if (stateCaptured &&
+        FAILED(device->StretchRect(
             backBuffer, nullptr, historySurface, nullptr, D3DTEXF_NONE))) {
         g_historyValid = false;
     }
-
-    // Restore GTA's exact D3D state before returning to its renderer/present path.
-    g_stateBlock->Apply();
 
     SafeRelease(backBuffer);
     SafeRelease(currentSurface);
     SafeRelease(historySurface);
 }
 
+HRESULT WINAPI HookEndScene(IDirect3DDevice9* device) {
+    if (!g_originalEndScene)
+        return D3DERR_INVALIDCALL;
+
+    if (g_inEndScene)
+        return g_originalEndScene(device);
+
+    g_inEndScene = true;
+
+    const HRESULT originalHr = g_originalEndScene(device);
+
+    if (SUCCEEDED(originalHr)) {
+        LoadSettings();
+        RenderTemporalBlend(device);
+    }
+
+    g_inEndScene = false;
+    return originalHr;
+}
+
 HRESULT WINAPI HookReset(IDirect3DDevice9* device,
                          D3DPRESENT_PARAMETERS* pp) {
     // D3DPOOL_DEFAULT resources must be released before Reset.
-    // Re-create them only after a successful reset.
     ReleaseResources();
 
     const HRESULT hr = g_originalReset(device, pp);
@@ -344,25 +364,6 @@ HRESULT WINAPI HookReset(IDirect3DDevice9* device,
         CreateResources(device);
 
     return hr;
-}
-
-HRESULT WINAPI HookPresent(IDirect3DDevice9* device,
-                           const RECT* src,
-                           const RECT* dst,
-                           HWND wnd,
-                           const RGNDATA* dirty) {
-    if (!g_inPresent) {
-        g_inPresent = true;
-        LoadSettings();
-
-        // Do not touch the device if the original hook is not ready.
-        if (g_originalPresent)
-            RenderTemporalBlend(device);
-
-        g_inPresent = false;
-    }
-
-    return g_originalPresent(device, src, dst, wnd, dirty);
 }
 
 bool PatchVTable(void** vtable, size_t index,
@@ -462,16 +463,15 @@ DWORD WINAPI InstallThread(LPVOID) {
     g_vtable = vtable;
 
     // IDirect3DDevice9 vtable:
-    // Reset = 16, Present = 17.
+    // Reset = 16, EndScene = 42.
     if (!PatchVTable(g_vtable, 16,
                      reinterpret_cast<void*>(&HookReset),
                      reinterpret_cast<void**>(&g_originalReset)))
         return 0;
 
-    if (!PatchVTable(g_vtable, 17,
-                     reinterpret_cast<void*>(&HookPresent),
-                     reinterpret_cast<void**>(&g_originalPresent))) {
-        // If Present could not be patched, restore Reset immediately.
+    if (!PatchVTable(g_vtable, 42,
+                     reinterpret_cast<void*>(&HookEndScene),
+                     reinterpret_cast<void**>(&g_originalEndScene))) {
         DWORD oldProtect = 0;
         if (VirtualProtect(&g_vtable[16], sizeof(void*),
                            PAGE_EXECUTE_READWRITE, &oldProtect)) {
