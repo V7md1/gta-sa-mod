@@ -192,15 +192,6 @@ void DrawTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture, float alp
     device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(Vertex));
 }
 
-void ApplyBlur(IDirect3DDevice9* device) {
-    if (!g_cfg.enabled || !EnsureResources(device))
-        return;
-
-    if (FAILED(device->StretchRect(g_backBuffer, nullptr,
-                                   static_cast<IDirect3DSurface9*>(nullptr), nullptr, D3DTEXF_NONE)))
-        return;
-}
-
 void RenderTemporalBlend(IDirect3DDevice9* device) {
     if (!g_cfg.enabled || !EnsureResources(device))
         return;
